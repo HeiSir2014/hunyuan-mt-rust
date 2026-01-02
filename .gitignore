@@ -1,0 +1,9 @@
+.venv
+.claude
+*.lock
+target/
+*.log
+
+.DS_Store
+
+models/
