@@ -4,12 +4,59 @@
 
 use anyhow::{bail, Context, Result};
 use candle_core::quantized::gguf_file;
-use candle_core::{Device, IndexOp, Tensor, DType};
+use candle_core::{Device, IndexOp, Tensor, DType, D};
 use candle_core::{Module, Result as CandleResult};
-use candle_nn::{RmsNorm, Embedding};
+use candle_nn::Embedding;
 use std::collections::HashMap;
 
 const MAX_SEQ_LEN: usize = 4096;
+
+/// Manual RmsNorm implementation compatible with Metal backend
+/// Uses basic tensor operations (sqr, sum_keepdim, sqrt, broadcast_div, broadcast_mul)
+/// that are supported by Metal, instead of the specialized rms_norm kernel.
+#[derive(Debug, Clone)]
+struct RmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl RmsNorm {
+    fn new(weight: Tensor, eps: f64) -> Self {
+        Self { weight, eps }
+    }
+}
+
+impl Module for RmsNorm {
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let x_dtype = x.dtype();
+        // Use F32 for numerical stability
+        let internal_dtype = match x_dtype {
+            DType::F16 | DType::BF16 => DType::F32,
+            d => d,
+        };
+        let hidden_size = x.dim(D::Minus1)?;
+        let x = x.to_dtype(internal_dtype)?;
+        // RMSNorm: x / sqrt(mean(x^2) + eps) * weight
+        let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
+        let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
+        x_normed.to_dtype(x_dtype)?.broadcast_mul(&self.weight)
+    }
+}
+
+/// Manual softmax implementation compatible with Metal backend
+/// softmax(x) = exp(x - max) / sum(exp(x - max))
+pub fn softmax_last_dim(xs: &Tensor) -> CandleResult<Tensor> {
+    let last_dim = xs.dims().len() - 1;
+    // Subtract max for numerical stability
+    let max = xs.max_keepdim(last_dim)?;
+    let diff = xs.broadcast_sub(&max)?;
+    // exp(x - max)
+    let num = diff.exp()?;
+    // sum(exp(x - max))
+    let den = num.sum_keepdim(last_dim)?;
+    // exp(x - max) / sum
+    num.broadcast_div(&den)
+}
 
 #[derive(Debug, Clone)]
 struct Mlp {
@@ -48,12 +95,32 @@ struct LayerWeights {
 }
 
 impl LayerWeights {
+    /// Manual RoPE implementation compatible with Metal backend
+    /// Uses basic tensor operations instead of the specialized rotary-emb kernel.
+    /// Implements the NeoX/contiguous style (not interleaved/GPT-J style).
     fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize) -> CandleResult<Tensor> {
-        let (_b_sz, _n_head, seq_len, _n_embd) = x.dims4()?;
+        let (_b_sz, _n_head, seq_len, n_embd) = x.dims4()?;
+
+        // cos/sin are [MAX_SEQ, head_dim/2], need to duplicate for full head_dim
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
-        // Use rope (contiguous/NeoX style) instead of rope_i (interleaved/GPT-J style)
-        candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
+
+        // Duplicate cos/sin for full head dimension: [seq, head_dim/2] -> [seq, head_dim]
+        let cos = Tensor::cat(&[&cos, &cos], D::Minus1)?;
+        let sin = Tensor::cat(&[&sin, &sin], D::Minus1)?;
+
+        // Reshape for broadcasting: [seq, n_embd] -> [1, 1, seq, n_embd]
+        let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
+        let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
+
+        // rotate_half: split last dim in half, negate second half, swap
+        let half = n_embd / 2;
+        let xs1 = x.narrow(D::Minus1, 0, half)?;
+        let xs2 = x.narrow(D::Minus1, half, half)?;
+        let x_rotated = Tensor::cat(&[&xs2.neg()?, &xs1], D::Minus1)?;
+
+        // Apply rotation: x * cos + rotate_half(x) * sin
+        x.broadcast_mul(&cos)? + x_rotated.broadcast_mul(&sin)?
     }
 
     fn forward_attn(
@@ -94,48 +161,21 @@ impl LayerWeights {
 
         self.kv_cache = Some((k.clone(), v.clone()));
 
-        // GQA: repeat K and V heads to match Q heads
-        let n_rep = self.n_head / self.n_kv_head;
-        let k = if n_rep > 1 {
-            let (b, n_kv, s, d) = k.dims4()?;
-            k.unsqueeze(2)?
-                .expand((b, n_kv, n_rep, s, d))?
-                .reshape((b, n_kv * n_rep, s, d))?
-        } else {
-            k
-        };
-        let v = if n_rep > 1 {
-            let (b, n_kv, s, d) = v.dims4()?;
-            v.unsqueeze(2)?
-                .expand((b, n_kv, n_rep, s, d))?
-                .reshape((b, n_kv * n_rep, s, d))?
-        } else {
-            v
-        };
-
-        // Scale
         let scale = 1.0 / (self.head_dim as f64).sqrt() as f32;
-        let q = (q * scale as f64)?;
 
-        // Attention scores: q is [b, n_head, seq, head_dim], k is [b, n_head, kv_seq, head_dim]
-        let k_t = k.transpose(2, 3)?; // [b, n_head, head_dim, kv_seq]
-        let scores = q.matmul(&k_t)?; // [b, n_head, seq, kv_seq]
+        // Debug: print shapes
+        // eprintln!("Q: {:?}, K: {:?}, V: {:?}", q.shape(), k.shape(), v.shape());
 
-        let scores = if let Some(mask) = mask {
-            // mask is u8 where 1 = masked (should be -inf), 0 = not masked
-            let mask = mask.broadcast_as(scores.shape())?;
-            let mask = mask.to_dtype(scores.dtype())?;
-            // Multiply mask by large negative number and add to scores
-            let neg_inf = Tensor::new(-1e9f32, scores.device())?.to_dtype(scores.dtype())?;
-            let masked = mask.broadcast_mul(&neg_inf)?;
-            // Add the masked values (mask * -1e9) to scores
-            (scores + masked)?
+        // Use optimized SDPA when possible
+        // SDPA handles GQA/MQA automatically when q_heads % kv_heads == 0
+        let attn = if seq_len == 1 {
+            // Single token generation - use SDPA (optimized for Metal)
+            // Q: [b, n_head, 1, head_dim], K/V: [b, n_kv_head, kv_seq, head_dim]
+            candle_nn::ops::sdpa(&q.contiguous()?, &k.contiguous()?, &v.contiguous()?, None, false, scale, 1.0)?
         } else {
-            scores
+            // Prompt processing - use causal SDPA
+            candle_nn::ops::sdpa(&q.contiguous()?, &k.contiguous()?, &v.contiguous()?, None, true, scale, 1.0)?
         };
-
-        let scores = candle_nn::ops::softmax_last_dim(&scores)?;
-        let attn = scores.matmul(&v)?; // [b, n_head, seq, head_dim]
 
         let attn = attn.transpose(1, 2)?.reshape((b_sz, seq_len, n_embd))?;
         self.attention_wo.forward(&attn)
