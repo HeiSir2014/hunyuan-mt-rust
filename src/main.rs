@@ -1,13 +1,110 @@
 use anyhow::{Context, Result};
-use candle_core::{quantized::gguf_file, Device, Tensor};
-use candle_transformers::generation::LogitsProcessor;
-use rand::Rng;
+use candle_core::{quantized::gguf_file, Device, Tensor, DType};
+use rand::{Rng, SeedableRng};
 use std::io::Write;
 use std::path::Path;
 use tokenizers::Tokenizer;
-use crate::hunyuan_model::HunyuanModel;
+use crate::hunyuan_model::{HunyuanModel, softmax_last_dim};
 
 mod hunyuan_model;
+
+/// Custom LogitsProcessor compatible with Metal backend
+/// Uses our manual softmax implementation instead of candle_nn::ops::softmax_last_dim
+struct LogitsProcessor {
+    rng: rand::rngs::StdRng,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+}
+
+impl LogitsProcessor {
+    fn new(seed: u64, temperature: Option<f64>, top_p: Option<f64>) -> Self {
+        let rng = if seed != 0 {
+            let bytes = seed.to_le_bytes();
+            let mut seed_array = [0u8; 32];
+            seed_array[..8].copy_from_slice(&bytes);
+            rand::rngs::StdRng::from_seed(seed_array)
+        } else {
+            rand::rngs::StdRng::from_entropy()
+        };
+        Self { rng, temperature, top_p }
+    }
+
+    /// Sample next token from logits
+    fn sample(&mut self, logits: &Tensor) -> Result<u32> {
+        let logits_f32 = logits.to_dtype(DType::F32)?;
+
+        // Apply temperature
+        let logits = match self.temperature {
+            Some(t) if t > 0.0 => (&logits_f32 / t)?,
+            _ => logits_f32,
+        };
+
+        // Get logits as Vec<f32>
+        let logits_vec: Vec<f32> = logits.to_vec1()?;
+
+        // Apply top-p filtering
+        let logits_filtered = match self.top_p {
+            Some(p) if p < 1.0 => self.top_p_filter(&logits_vec, p as f32),
+            _ => logits_vec,
+        };
+
+        // Convert back to tensor for softmax
+        let logits_tensor = Tensor::new(&*logits_filtered, logits.device())?;
+
+        // Apply our Metal-compatible softmax
+        let probs = softmax_last_dim(&logits_tensor)?;
+
+        // Get probabilities as Vec<f32>
+        let probs_vec: Vec<f32> = probs.to_vec1()?;
+
+        // Sample from distribution
+        let r: f32 = self.rng.gen();
+        let mut cumsum = 0.0;
+        for (i, &p) in probs_vec.iter().enumerate() {
+            cumsum += p;
+            if r <= cumsum {
+                return Ok(i as u32);
+            }
+        }
+
+        // Fallback: return most probable token
+        Ok(probs_vec.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0))
+    }
+
+    /// Top-p (nucleus) filtering
+    fn top_p_filter(&self, logits: &[f32], p: f32) -> Vec<f32> {
+        // Convert to probabilities first
+        let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp_logits: Vec<f32> = logits.iter().map(|&x| (x - max_logit).exp()).collect();
+        let sum_exp: f32 = exp_logits.iter().sum();
+        let probs: Vec<(usize, f32)> = exp_logits.iter().enumerate().map(|(i, &x)| (i, x / sum_exp)).collect();
+
+        // Sort by probability descending
+        let mut sorted_probs = probs.clone();
+        sorted_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        // Find cutoff
+        let mut cumsum = 0.0f32;
+        let mut cutoff_idx = sorted_probs.len();
+        for (i, &(_, prob)) in sorted_probs.iter().enumerate() {
+            cumsum += prob;
+            if cumsum >= p {
+                cutoff_idx = i + 1;
+                break;
+            }
+        }
+
+        // Keep only top-p tokens
+        let kept: std::collections::HashSet<usize> = sorted_probs[..cutoff_idx].iter().map(|&(i, _)| i).collect();
+        logits.iter().enumerate().map(|(i, &l)| {
+            if kept.contains(&i) { l } else { f32::NEG_INFINITY }
+        }).collect()
+    }
+}
 
 fn main() -> Result<()> {
     println!("Hunyuan 1.8B GGUF Inference with Candle");
@@ -16,9 +113,9 @@ fn main() -> Result<()> {
     let model_path = Path::new("models/HY-MT1.5-1.8B-GGUF/HY-MT1.5-1.8B-Q8_0.gguf");
     let tokenizer_path = Path::new("models/HY-MT1.5-1.8B/tokenizer.json");
 
-    // Device selection - using CPU on macOS due to missing Metal RMSNorm kernel
+    // Device selection - try Metal on macOS, fallback to CPU
     #[cfg(target_os = "macos")]
-    let device = Device::Cpu;
+    let device = Device::new_metal(0).unwrap_or_else(|_| Device::Cpu);
 
     #[cfg(not(target_os = "macos"))]
     let device = Device::cuda_if_available(0).unwrap_or_else(|_| Device::Cpu);
