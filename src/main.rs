@@ -162,50 +162,68 @@ fn main() -> Result<()> {
     println!("Generating...\n");
 
     let start = std::time::Instant::now();
-    let mut all_tokens = prompt_tokens.clone();
+    let eos_token_id: u32 = 120020;  // From model config.json
 
-    // Process the full prompt first
-    let input = Tensor::new(prompt_tokens.as_slice(), &device)?.unsqueeze(0)?;
-    let logits = model.forward(&input, 0)?;
-    let logits = logits.squeeze(0)?;
-    let mut next_token = logits_processor.sample(&logits)?;
-    all_tokens.push(next_token);
+    // Generator-like token stream
+    let token_stream = std::iter::from_fn({
+        let mut all_tokens = prompt_tokens.clone();
+        let mut pos = 0usize;
+        let mut first = true;
 
-    if let Ok(text) = tokenizer.decode(&[next_token], true) {
-        print!("{}", text);
-        std::io::stdout().flush()?;
-    }
+        move || -> Option<Result<u32>> {
+            if first {
+                // First token: process full prompt
+                first = false;
+                let input = Tensor::new(all_tokens.as_slice(), &device).ok()?.unsqueeze(0).ok()?;
+                let logits = model.forward(&input, pos).ok()?.squeeze(0).ok()?;
+                let token = logits_processor.sample(&logits).ok()?;
+                all_tokens.push(token);
+                pos = 1;
+                return Some(Ok(token));
+            }
 
-    // EOS token ID for Hunyuan
-    let eos_token_id = 120020;
+            // Subsequent tokens: use single token input
+            let input_token = *all_tokens.last().unwrap();
+            if input_token == eos_token_id {
+                return None;
+            }
 
-    // Continue generation
-    for i in 1..100 {
-        if next_token == eos_token_id {
-            break;
+            let input = Tensor::new(&[input_token], &device).ok()?.unsqueeze(0).ok()?;
+            let logits = model.forward(&input, pos).ok()?.squeeze(0).ok()?;
+            let token = logits_processor.sample(&logits).ok()?;
+            all_tokens.push(token);
+            pos += 1;
+
+            Some(Ok(token))
         }
+    });
 
-        let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
-        let logits = model.forward(&input, prompt_tokens.len() + i - 1)?;
-        let logits = logits.squeeze(0)?;
+    // Consume the stream
+    let mut generated_count = 0;
+    for token_result in token_stream {
+        match token_result {
+            Ok(token) => {
+                generated_count += 1;
 
-        next_token = logits_processor.sample(&logits)?;
-        all_tokens.push(next_token);
+                if token == eos_token_id {
+                    break;
+                }
 
-        if next_token == eos_token_id {
-            break;
-        }
-
-        if let Ok(text) = tokenizer.decode(&[next_token], true) {
-            print!("{}", text);
-            std::io::stdout().flush()?;
+                if let Ok(text) = tokenizer.decode(&[token], true) {
+                    print!("{}", text);
+                    std::io::stdout().flush()?;
+                }
+            }
+            Err(e) => {
+                eprintln!("[ERROR] Generation error: {:?}", e);
+                break;
+            }
         }
     }
 
     let elapsed = start.elapsed();
-    let generated = all_tokens.len() - prompt_tokens.len();
     println!("\n\nGenerated {} tokens in {:.2}s ({:.2} tok/s)",
-             generated, elapsed.as_secs_f32(), generated as f32 / elapsed.as_secs_f32());
+             generated_count, elapsed.as_secs_f32(), generated_count as f32 / elapsed.as_secs_f32());
 
     Ok(())
 }
