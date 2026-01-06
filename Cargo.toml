@@ -3,15 +3,14 @@ name = "hunyuan-infer"
 version = "0.1.0"
 edition = "2021"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { path = "third_party/candle/candle-core", features = ["metal"] }
-candle-nn = { path = "third_party/candle/candle-nn", features = ["metal"] }
-
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-candle-core = { path = "third_party/candle/candle-core", features = ["cuda"] }
-candle-nn = { path = "third_party/candle/candle-nn", features = ["cuda"] }
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
 
 [dependencies]
+candle-core = { path = "third_party/candle/candle-core" }
+candle-nn = { path = "third_party/candle/candle-nn" }
 candle-transformers = { path = "third_party/candle/candle-transformers" }
 tokenizers = "0.20"
 anyhow = "1.0"
@@ -24,3 +23,7 @@ rand = "0.8"
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# Force all dependencies to use cudarc 0.18 for CUDA 13 support
+[patch.crates-io]
+cudarc = { git = "https://github.com/coreylowman/cudarc", tag = "v0.18.2" }

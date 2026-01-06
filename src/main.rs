@@ -8,6 +8,41 @@ use crate::hunyuan_model::{HunyuanModel, softmax_last_dim};
 
 mod hunyuan_model;
 
+/// Select the best available device at runtime
+fn select_device() -> Device {
+    // Try Metal on macOS
+    #[cfg(target_os = "macos")]
+    {
+        match Device::new_metal(0) {
+            Ok(device) => {
+                println!("✓ Metal GPU detected");
+                return device;
+            }
+            Err(_) => println!("✗ Metal GPU not available"),
+        }
+    }
+
+    // Try CUDA on non-macOS (only if compiled with cuda feature)
+    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+    {
+        match Device::cuda_if_available(0) {
+            Ok(device) if !matches!(device, Device::Cpu) => {
+                println!("✓ CUDA GPU detected");
+                return device;
+            }
+            _ => println!("✗ CUDA GPU not available"),
+        }
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
+    {
+        println!("ℹ CUDA support not compiled (use --features cuda to enable)");
+    }
+
+    println!("→ Using CPU");
+    Device::Cpu
+}
+
 /// Custom LogitsProcessor compatible with Metal backend
 /// Uses our manual softmax implementation instead of candle_nn::ops::softmax_last_dim
 struct LogitsProcessor {
@@ -113,13 +148,8 @@ fn main() -> Result<()> {
     let model_path = Path::new("models/HY-MT1.5-1.8B-GGUF/HY-MT1.5-1.8B-Q8_0.gguf");
     let tokenizer_path = Path::new("models/HY-MT1.5-1.8B/tokenizer.json");
 
-    // Device selection - try Metal on macOS, fallback to CPU
-    #[cfg(target_os = "macos")]
-    let device = Device::new_metal(0).unwrap_or_else(|_| Device::Cpu);
-
-    #[cfg(not(target_os = "macos"))]
-    let device = Device::cuda_if_available(0).unwrap_or_else(|_| Device::Cpu);
-
+    // Device selection with runtime detection
+    let device = select_device();
     println!("Using device: {:?}", device);
 
     // Load GGUF model
@@ -174,9 +204,26 @@ fn main() -> Result<()> {
             if first {
                 // First token: process full prompt
                 first = false;
-                let input = Tensor::new(all_tokens.as_slice(), &device).ok()?.unsqueeze(0).ok()?;
-                let logits = model.forward(&input, pos).ok()?.squeeze(0).ok()?;
-                let token = logits_processor.sample(&logits).ok()?;
+                let input = match Tensor::new(all_tokens.as_slice(), &device) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(anyhow::anyhow!("Failed to create input tensor: {:?}", e))),
+                };
+                let input = match input.unsqueeze(0) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(anyhow::anyhow!("Failed to unsqueeze input: {:?}", e))),
+                };
+                let logits = match model.forward(&input, pos) {
+                    Ok(l) => l,
+                    Err(e) => return Some(Err(anyhow::anyhow!("Forward pass failed: {:?}", e))),
+                };
+                let logits = match logits.squeeze(0) {
+                    Ok(l) => l,
+                    Err(e) => return Some(Err(anyhow::anyhow!("Failed to squeeze logits: {:?}", e))),
+                };
+                let token = match logits_processor.sample(&logits) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(anyhow::anyhow!("Sampling failed: {:?}", e))),
+                };
                 all_tokens.push(token);
                 pos = 1;
                 return Some(Ok(token));
@@ -188,9 +235,26 @@ fn main() -> Result<()> {
                 return None;
             }
 
-            let input = Tensor::new(&[input_token], &device).ok()?.unsqueeze(0).ok()?;
-            let logits = model.forward(&input, pos).ok()?.squeeze(0).ok()?;
-            let token = logits_processor.sample(&logits).ok()?;
+            let input = match Tensor::new(&[input_token], &device) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(anyhow::anyhow!("Failed to create input tensor: {:?}", e))),
+            };
+            let input = match input.unsqueeze(0) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(anyhow::anyhow!("Failed to unsqueeze input: {:?}", e))),
+            };
+            let logits = match model.forward(&input, pos) {
+                Ok(l) => l,
+                Err(e) => return Some(Err(anyhow::anyhow!("Forward pass failed: {:?}", e))),
+            };
+            let logits = match logits.squeeze(0) {
+                Ok(l) => l,
+                Err(e) => return Some(Err(anyhow::anyhow!("Failed to squeeze logits: {:?}", e))),
+            };
+            let token = match logits_processor.sample(&logits) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(anyhow::anyhow!("Sampling failed: {:?}", e))),
+            };
             all_tokens.push(token);
             pos += 1;
 

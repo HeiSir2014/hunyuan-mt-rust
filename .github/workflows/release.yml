@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-cpu:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Build CPU version
+        run: cargo build --release
+
+      - name: Rename binary
+        run: mv target/release/hunyuan-infer.exe hunyuan-infer-cpu.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hunyuan-infer-cpu
+          path: hunyuan-infer-cpu.exe
+
+  build-cuda:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Setup CUDA
+        uses: Jimver/cuda-toolkit@v0.2.11
+        with:
+          cuda: '12.1.0'
+
+      - name: Build CUDA version
+        run: cargo build --release --features cuda
+
+      - name: Rename binary
+        run: mv target/release/hunyuan-infer.exe hunyuan-infer-cuda.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hunyuan-infer-cuda
+          path: hunyuan-infer-cuda.exe
+
+  release:
+    needs: [build-cpu, build-cuda]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            hunyuan-infer-cpu/hunyuan-infer-cpu.exe
+            hunyuan-infer-cuda/hunyuan-infer-cuda.exe

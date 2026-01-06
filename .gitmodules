@@ -1,5 +1,4 @@
 [submodule "third_party/candle"]
 	path = third_party/candle
 	url = git@github.com:huggingface/candle.git
-	update = none
-	recurse = true
+	shallow = true
