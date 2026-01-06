@@ -123,10 +123,67 @@ impl LayerWeights {
         x.broadcast_mul(&cos)? + x_rotated.broadcast_mul(&sin)?
     }
 
+    /// Repeat KV heads to match Q heads for GQA (Grouped Query Attention)
+    /// K/V: [b, n_kv_head, seq, head_dim] -> [b, n_head, seq, head_dim]
+    fn repeat_kv(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let n_rep = self.n_head / self.n_kv_head;
+        if n_rep == 1 {
+            return Ok(x.clone());
+        }
+        let (b_sz, n_kv_head, seq_len, head_dim) = x.dims4()?;
+        // [b, n_kv, seq, dim] -> [b, n_kv, 1, seq, dim] -> [b, n_kv, n_rep, seq, dim]
+        let x = x.unsqueeze(2)?
+            .expand((b_sz, n_kv_head, n_rep, seq_len, head_dim))?
+            .reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))?;
+        Ok(x)
+    }
+
+    /// Manual scaled dot-product attention for CPU backend
+    /// softmax(Q @ K^T / sqrt(d)) @ V
+    fn manual_attn(&self, q: &Tensor, k: &Tensor, v: &Tensor, scale: f32, is_causal: bool) -> CandleResult<Tensor> {
+        // Repeat K and V for GQA
+        let k = self.repeat_kv(k)?;
+        let v = self.repeat_kv(v)?;
+
+        // Q @ K^T: [b, n_head, q_seq, head_dim] @ [b, n_head, head_dim, kv_seq] -> [b, n_head, q_seq, kv_seq]
+        let attn_scores = q.contiguous()?.matmul(&k.contiguous()?.transpose(D::Minus2, D::Minus1)?)?;
+
+        // Scale
+        let attn_scores = (attn_scores * (scale as f64))?;
+
+        // Apply causal mask if needed
+        let attn_scores = if is_causal {
+            let (_, _, q_len, kv_len) = attn_scores.dims4()?;
+            // Create causal mask: positions where j > i should be -inf
+            let mask: Vec<f32> = (0..q_len)
+                .flat_map(|i| {
+                    (0..kv_len).map(move |j| {
+                        // For causal attention, mask out future positions
+                        // j is the key position, i is the query position
+                        // For prompt processing (q_len == kv_len), mask j > i
+                        // This assumes q positions are at the end of kv sequence
+                        let q_pos = kv_len - q_len + i;
+                        if j > q_pos { f32::NEG_INFINITY } else { 0.0 }
+                    })
+                })
+                .collect();
+            let mask = Tensor::from_slice(&mask, (q_len, kv_len), attn_scores.device())?;
+            attn_scores.broadcast_add(&mask)?
+        } else {
+            attn_scores
+        };
+
+        // Softmax over last dimension (kv_seq)
+        let attn_probs = softmax_last_dim(&attn_scores)?;
+
+        // @ V: [b, n_head, q_seq, kv_seq] @ [b, n_head, kv_seq, head_dim] -> [b, n_head, q_seq, head_dim]
+        attn_probs.matmul(&v.contiguous()?)
+    }
+
     fn forward_attn(
         &mut self,
         x: &Tensor,
-        mask: Option<&Tensor>,
+        _mask: Option<&Tensor>,
         index_pos: usize,
     ) -> CandleResult<Tensor> {
         let (b_sz, seq_len, n_embd) = x.dims3()?;
@@ -162,19 +219,19 @@ impl LayerWeights {
         self.kv_cache = Some((k.clone(), v.clone()));
 
         let scale = 1.0 / (self.head_dim as f64).sqrt() as f32;
+        let is_causal = seq_len > 1;
 
-        // Debug: print shapes
-        // eprintln!("Q: {:?}, K: {:?}, V: {:?}", q.shape(), k.shape(), v.shape());
-
-        // Use optimized SDPA when possible
-        // SDPA handles GQA/MQA automatically when q_heads % kv_heads == 0
-        let attn = if seq_len == 1 {
-            // Single token generation - use SDPA (optimized for Metal)
-            // Q: [b, n_head, 1, head_dim], K/V: [b, n_kv_head, kv_seq, head_dim]
-            candle_nn::ops::sdpa(&q.contiguous()?, &k.contiguous()?, &v.contiguous()?, None, false, scale, 1.0)?
-        } else {
-            // Prompt processing - use causal SDPA
-            candle_nn::ops::sdpa(&q.contiguous()?, &k.contiguous()?, &v.contiguous()?, None, true, scale, 1.0)?
+        // Use optimized SDPA for GPU, manual attention for CPU
+        let attn = match x.device() {
+            Device::Cpu => {
+                // Manual attention for CPU
+                self.manual_attn(&q, &k, &v, scale, is_causal)?
+            }
+            _ => {
+                // SDPA for GPU (Metal/CUDA)
+                // SDPA handles GQA/MQA automatically when q_heads % kv_heads == 0
+                candle_nn::ops::sdpa(&q.contiguous()?, &k.contiguous()?, &v.contiguous()?, None, is_causal, scale, 1.0)?
+            }
         };
 
         let attn = attn.transpose(1, 2)?.reshape((b_sz, seq_len, n_embd))?;

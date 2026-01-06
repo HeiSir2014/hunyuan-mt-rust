@@ -2,7 +2,13 @@
 
 # Hunyuan MT Rust Inference
 
-使用 Candle 框架实现的 Hunyuan Dense 1.8B GGUF 推理引擎。
+<div align="center">
+
+<img src="https://burn.dev/favicon.svg" width="64" height="64" alt="Burn Logo">
+
+使用 Candle 框架实现的 Hunyuan Dense 1.8B GGUF 推理引擎。未来计划迁移至 [Burn](https://burn.dev/) 以获得更好的性能和更广泛的 Rust 原生支持。
+
+</div>
 
 ## 快速开始
 
@@ -11,9 +17,63 @@
 git clone --recurse-submodules git@github.com:HeiSir2014/hunyuan-mt-rust.git
 cd hunyuan-mt-rust
 
-# 构建并运行
+# CPU 模式（默认，无需 GPU）
+cargo build --release --features ""
 cargo run --release
+
+# CUDA 模式（需要 NVIDIA GPU + CUDA Toolkit）
+cargo build --release --features cuda
+cargo run --release --features cuda
+
+# Metal 模式（macOS）
+cargo build --release --features metal
+cargo run --release --features metal
 ```
+
+或者使用构建脚本（Windows）：
+
+```bash
+# CPU 模式
+cargo build --release
+cargo run --release
+
+# CUDA 模式（自动检测 compute capability）
+build-cuda.bat
+```
+
+## 平台支持
+
+| 平台 | 推荐模式 | 说明 |
+|------|---------|------|
+| **macOS** | Metal | 只需 `cargo run --release`（默认）或 `--features metal` |
+| **Windows + NVIDIA** | CUDA | 使用 `build-cuda.bat` 或 `--features cuda` |
+| **Windows 无显卡** | CPU | `cargo run --release` |
+| **Linux + NVIDIA** | CUDA | `--features cuda` |
+| **Linux 无显卡** | CPU | `cargo run --release` |
+
+### GPU 模式要求
+
+**CUDA (Windows/Linux):**
+- NVIDIA GPU
+- CUDA Toolkit 12.x
+- Visual Studio Build Tools (Windows)
+- 或者使用 `x64 Native Tools Command Prompt for VS 2022`
+
+**Metal (macOS):**
+- Apple Silicon (M1/M2/M3)
+- macOS 12.0+
+
+### Compute Capability 参考
+
+| Compute Capability | GPU 系列 |
+|--------------------|----------|
+| 89 | RTX 40 系列 |
+| 86 | RTX 30 系列 |
+| 75 | RTX 20 系列 |
+| 70 | V100 |
+| 60 | P100 |
+
+`build-cuda.bat` 会自动从 nvidia-smi 检测 compute capability。
 
 ## 模型文件
 
@@ -152,13 +212,12 @@ src/
 
 | 平台 | 后端 | 速度 |
 |------|------|------|
-| macOS M 系列 | Metal GPU (SDPA) | ~31 tok/s |
+| macOS M 系列 | Metal GPU | ~31 tok/s |
 | macOS M 系列 | CPU | ~14 tok/s |
+| Windows/Linux | CUDA GPU | ~xx tok/s (待测试) |
+| Windows/Linux | CPU | ~19 tok/s (Intel i7/AMD Ryzen 等主流 CPU) |
 
-## 平台支持
-
-- **macOS**: 使用 Metal GPU 加速
-- **Linux/Windows**: 使用 CUDA 加速
+> **注意**: CPU 推理速度取决于 CPU 型号、核心数和内存速度。以上数据仅供参考。
 
 ## 实现过程中遇到的问题
 
@@ -262,9 +321,47 @@ candle_nn::ops::sdpa(&q, &k, &v, None, is_causal, scale, 1.0)?
 
 **解决方案**: 使用 third_party 中的 candle 0.9.2-alpha.2，该版本包含完整的 Metal SDPA 实现。
 
+## Features
+
+| Feature | 说明 |
+|---------|------|
+| `cuda` | 启用 CUDA GPU 支持（需要 CUDA Toolkit） |
+| `metal` | 启用 Metal GPU 支持（macOS） |
+| (默认) | CPU 模式，无 GPU 依赖 |
+
 ## 依赖
 
-- `candle-core` - 张量计算 (需启用 metal/cuda feature)
-- `candle-nn` - 神经网络层 (需启用 metal/cuda feature 以支持 SDPA)
+- `candle-core` - 张量计算
+- `candle-nn` - 神经网络层
 - `candle-transformers` - 模型组件
 - `tokenizers` - HuggingFace tokenizer
+
+---
+
+## TODOS: Future Improvements with Burn
+
+Consider migrating to [Burn](https://burn.dev/) framework for improved Rust-native ML inference:
+
+### Why Burn?
+
+- **Pure Rust**: 100% Rust implementation, no C/C++ bindings
+- **Better Performance**: Native CPU optimization with multi-threading
+- **Wider GPU Support**: Backend support for CUDA, Metal, and OpenCL
+- **Active Development**: Modern, well-maintained framework
+- **Auto-grad**: Built-in autograd support for training
+
+### Migration Plan
+
+- [ ] Evaluate Burn's GGUF support and quantized inference capabilities
+- [ ] Port HunyuanModel to Burn's module system
+- [ ] Implement Hunyuan-specific operators (QK Norm, RoPE, etc.) in Burn
+- [ ] Add Burn-based inference backend with fallback to Candle
+- [ ] Benchmark performance comparison between Burn and Candle backends
+- [ ] Update build system to support both Burn and Candle modes
+- [ ] Add Burn-specific examples and documentation
+
+### References
+
+- [Burn GitHub](https://github.com/tracel-ai/burn)
+- [Burn Documentation](https://burn.dev/)
+- [Burn GGUF Support](https://github.com/tracel-ai/burn/issues?q=gguf)
